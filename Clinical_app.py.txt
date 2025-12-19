@@ -1,0 +1,111 @@
+import streamlit as st
+import openai
+import json
+from docx import Document
+import plotly.graph_objects as go
+from fpdf import FPDF
+import io
+
+# --- 1. CLINICAL DATABASE (BASED ON ATTACHMENTS) ---
+MANDATORY_STANDARDS = {
+    "Adult": {
+        "Standard": [
+            {"name": "Mental Status Examination", "req": True},
+            {"name": "WHO QOL", "req": True},
+            {"name": "HAM A / D", "req": True},
+            {"name": "NPI", "req": False},  # Optional per source [cite: 2]
+            {"name": "WHO DAS II", "req": True},
+            {"name": "Standard Physiotherapy Template", "req": True},
+            {"name": "Routine EEG (Short)", "req": True}
+        ],
+        "Category 1": [{"name": "Rorschach", "req": True}, {"name": "Yale-Brown Obsessive Compulsive Scale (Y-BOCS)", "req": True}],
+        "Category 7": [{"name": "Abnormal Involuntary Movement Scale", "req": True}, {"name": "Unified Parkinson's disease rating scale", "req": True}],
+        "Category 8": [{"name": "Trunk Control Test (TCT)", "req": True}, {"name": "Barthel Index (BI)", "req": True}, {"name": "Timed Up-and-Go (TUG)", "req": True}, {"name": "6-Minute Walk Test", "req": True}, {"name": "Addenbrooke's Cognitive Examination (ACE)", "req": True}]
+    },
+    "Child": {
+        "Standard": [
+            {"name": "Vineland Social Maturity Scale (VSMR)", "req": True},
+            {"name": "American Association on Mental Retardation (AAMR)", "req": True},
+            {"name": "MI Checklist", "req": True},
+            {"name": "MATCH Protocol", "req": True},
+            {"name": "Routine EEG", "req": True}
+        ],
+        "Category 4": [{"name": "Binet Kamat Intelligence Test (BKT)", "req": True}, {"name": "Vanderbilt Assessment Scale", "req": True}, {"name": "Childhood Autism Rating Scale", "req": True}]
+    },
+    "Elder": {
+        "Standard": [
+            {"name": "Mental Status Examination", "req": True},
+            {"name": "Addenbrooke's Cognitive Examination", "req": True},
+            {"name": "HAM A / D", "req": True},
+            {"name": "WHO QOL", "req": True},
+            {"name": "Zarit Burden Interview", "req": True},
+            {"name": "General Health Questionnaire", "req": True}
+        ],
+        "Category 6": [{"name": "Everyday Activity Screening for India (EASI)", "req": True}, {"name": "Geriatric Depression Scale (GDS)", "req": True}, {"name": "Clinical Dementia Rating Scale (CDR)", "req": True}]
+    }
+}
+
+# --- 2. LOGIC FUNCTIONS ---
+def extract_text(file):
+    doc = Document(file)
+    content = []
+    for table in doc.tables:
+        for row in table.rows:
+            content.append(" | ".join(cell.text for cell in row.cells))
+    for para in doc.paragraphs:
+        if para.text.strip(): content.append(para.text)
+    return "\n".join(content)
+
+def get_ai_analysis(text, api_key):
+    client = openai.OpenAI(api_key=api_key)
+    prompt = f"""
+    Analyze the clinical report. 
+    1. Map to one of 13 Categories.
+    2. Assess 4 Pillars: Mind, Memory, Mobility, Lifestyle (RAG Status & Score).
+    3. Extract exact Specialist Concerns and Recommendations.
+    Return JSON: 
+    {{ "category": "", "cat_no": 0, "pillars": [{{ "name": "Mind", "status": "Red", "value": 1, "insight": "" }}], "concerns": [], "recommendations": [] }}
+    Report: {text}
+    """
+    response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}], response_format={ "type": "json_object" })
+    return json.loads(response.choices[0].message.content)
+
+class PDFReport(FPDF):
+    def header(self):
+        self.set_font('Arial', 'B', 15)
+        self.cell(0, 10, 'Clinical Infographic Summary', 0, 1, 'C')
+
+# --- 3. STREAMLIT INTERFACE ---
+st.set_page_config(layout="wide")
+st.sidebar.title("App Settings")
+api_key = st.sidebar.text_input("Enter OpenAI Key", type="password")
+age_group = st.sidebar.selectbox("Age Group", ["Adult", "Child", "Elder"])
+
+uploaded_file = st.file_uploader("Upload Word Doc", type="docx")
+
+if uploaded_file and api_key:
+    raw_text = extract_text(uploaded_file)
+    data = get_ai_analysis(raw_text, api_key)
+    
+    # Audit Logic
+    st.subheader(f"Diagnosis: Category {data['cat_no']} - {data['category']}")
+    
+    # Audit Display
+    reqs = MANDATORY_STANDARDS[age_group].get("Standard", []) + MANDATORY_STANDARDS[age_group].get(f"Category {data['cat_no']}", [])
+    gaps = [r['name'] for r in reqs if r['req'] and r['name'].lower() not in raw_text.lower()]
+    
+    if gaps:
+        st.error(f"Missing Mandatory Tests: {', '.join(gaps)}")
+    else:
+        st.success("All mandatory baseline assessments detected.")
+
+    # Radar Chart
+    categories = [p['name'] for p in data['pillars']]
+    values = [p['value'] for p in data['pillars']]
+    fig = go.Figure(data=go.Scatterpolar(r=values + [values[0]], theta=categories + [categories[0]], fill='toself'))
+    st.plotly_chart(fig)
+    
+    # Pillar Cards
+    cols = st.columns(4)
+    for i, p in enumerate(data['pillars']):
+        cols[i].info(f"**{p['name']}**\n\nStatus: {p['status']}\n\n{p['insight']}")
